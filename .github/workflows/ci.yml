@@ -1,0 +1,91 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - run: pip install -e ".[dev]"
+
+      - name: the hook name list still matches this box's git
+        # The one claim in here that a newer git could falsify. If git grows a
+        # hook name, whichhook would call a live hook dead, so the suite should
+        # be the thing that notices rather than a user.
+        run: |
+          git --version
+          if man githooks >/dev/null 2>&1; then
+            man githooks | col -b | grep -oE '^   [a-z][a-z0-9-]*$' | tr -d ' ' | sort > /tmp/from-man
+            whichhook --list-hooks | sed -n 's/^  \([a-z].*\)$/\1/p' | sort > /tmp/from-tool
+            diff /tmp/from-man /tmp/from-tool || {
+              echo "git's githooks(5) and whichhook's list have diverged -- see the diff above"
+              exit 1
+            }
+            echo "$(wc -l < /tmp/from-tool) names, matching githooks(5)"
+          else
+            echo "no man page on this runner; skipping the cross-check"
+          fi
+
+      - run: python -m pytest
+
+  dogfood:
+    # Run it on real repositories. A tool that has only ever been run by its own
+    # test suite is a tool nobody has run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+
+      - name: on itself, which should be clean
+        run: whichhook .
+
+      - name: on a repo whose hooks are configured and not installed
+        # pre-commit's own repository. Freshly cloned, its checks do not run --
+        # which is the framework working as designed and worth saying out loud.
+        run: |
+          git clone -q --depth 1 https://github.com/pre-commit/pre-commit /tmp/pc
+          whichhook /tmp/pc && {
+            echo "expected a manager-not-installed finding on a fresh clone"
+            exit 1
+          }
+          whichhook /tmp/pc --json | python -c '
+import json, sys
+kinds = {f["kind"] for f in json.load(sys.stdin)["findings"]}
+assert kinds == {"manager-not-installed"}, kinds
+print("found exactly:", kinds)
+'
+
+      - name: a shadowed hook is still found end to end
+        run: |
+          git init -q /tmp/shadow && cd /tmp/shadow
+          printf '#!/bin/sh\nexit 1\n' > .git/hooks/pre-commit
+          chmod +x .git/hooks/pre-commit
+          mkdir -p .husky/_ && git config core.hooksPath .husky/_
+          printf '#!/bin/sh\nexit 0\n' > .husky/_/pre-commit
+          chmod +x .husky/_/pre-commit
+          whichhook . --json | python -c '
+import json, sys
+findings = json.load(sys.stdin)["findings"]
+assert [f["kind"] for f in findings] == ["shadowed"], findings
+assert findings[0]["silent"] is True
+print("shadowed, silent, as measured")
+'
