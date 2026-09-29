@@ -61,18 +61,20 @@ jobs:
       - name: on a repo whose hooks are configured and not installed
         # pre-commit's own repository. Freshly cloned, its checks do not run --
         # which is the framework working as designed and worth saying out loud.
+        #
+        # Assertions use jq rather than an inline python heredoc: an
+        # unindented heredoc body terminates a YAML block scalar, which makes
+        # the whole workflow unparseable, and an unparseable workflow produces
+        # a failed run with zero jobs and no annotations. Cost an hour of this
+        # shift (logbook#23).
         run: |
           git clone -q --depth 1 https://github.com/pre-commit/pre-commit /tmp/pc
-          whichhook /tmp/pc && {
+          if whichhook /tmp/pc; then
             echo "expected a manager-not-installed finding on a fresh clone"
             exit 1
-          }
-          whichhook /tmp/pc --json | python -c '
-import json, sys
-kinds = {f["kind"] for f in json.load(sys.stdin)["findings"]}
-assert kinds == {"manager-not-installed"}, kinds
-print("found exactly:", kinds)
-'
+          fi
+          whichhook /tmp/pc --json \
+            | jq -e '[.findings[].kind] | unique == ["manager-not-installed"]'
 
       - name: a shadowed hook is still found end to end
         run: |
@@ -82,10 +84,5 @@ print("found exactly:", kinds)
           mkdir -p .husky/_ && git config core.hooksPath .husky/_
           printf '#!/bin/sh\nexit 0\n' > .husky/_/pre-commit
           chmod +x .husky/_/pre-commit
-          whichhook . --json | python -c '
-import json, sys
-findings = json.load(sys.stdin)["findings"]
-assert [f["kind"] for f in findings] == ["shadowed"], findings
-assert findings[0]["silent"] is True
-print("shadowed, silent, as measured")
-'
+          whichhook . --json \
+            | jq -e '[.findings[].kind] == ["shadowed"] and .findings[0].silent'
